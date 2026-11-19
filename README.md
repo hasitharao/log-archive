@@ -104,6 +104,4 @@ Let S3 handle long-term retention with a lifecycle rule on the `mac-logs/` prefi
 - Rewrite in Python or Go for a single distributable binary
 
 ---
-Solution for the roadmap.sh project: cd ~/projects/log-archive
-printf '\n---\nSolution for the roadmap.sh project: %s\n' "$(pbpaste)" >> README.md
-tail -3 README.md
+Solution for the roadmap.sh project: https://roadmap.sh/projects/log-archive-tool
