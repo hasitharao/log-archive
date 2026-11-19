@@ -103,7 +103,7 @@ if ! ENTRIES="$(tar -tzf "$ARCHIVE_PATH" | wc -l)"; then
   exit 1
 fi
 ENTRIES="${ENTRIES//[[:space:]]/}"
-SIZE="$(du -h "$ARCHIVE_PATH" | cut -f1)"
+SIZE="$(du -h "$ARCHIVE_PATH" | cut -f1 | tr -d " ")"
 
 log OK "source=$LOG_DIR archive=$ARCHIVE_PATH size=$SIZE entries=$ENTRIES"
 
