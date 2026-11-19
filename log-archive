@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+#
+# log-archive - compress a log directory into a timestamped .tar.gz,
+# record every run in archive.log, and optionally prune old archives
+# and/or copy the archive to S3.
+#
+# Works with the stock macOS toolchain (bash 3.2 + bsdtar) and Linux (GNU tar).
+
+set -Eeuo pipefail
+umask 077   # archives may contain sensitive data: owner-only access
+
+PROG="$(basename "$0")"
+OUT_DIR="${LOG_ARCHIVE_DIR:-$HOME/log-archives}"
+RETENTION_DAYS=""
+S3_DEST=""
+LOG_DIR=""
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options] <log-directory>
+
+Compress <log-directory> into logs_archive_YYYYMMDD_HHMMSS.tar.gz and
+record the run in archive.log.
+
+Options:
+  -o, --output DIR      Directory for archives and archive.log
+                        (default: \$LOG_ARCHIVE_DIR or ~/log-archives)
+  -r, --retention DAYS  Delete archives in the output dir older than DAYS
+      --s3 S3_URI       Also upload the archive, e.g. s3://my-bucket/logs/
+  -h, --help            Show this help
+
+Examples:
+  $PROG /var/log
+  $PROG -o ~/archives -r 30 /var/log
+  $PROG --s3 s3://my-bucket/mac-logs/ /var/log
+EOF
+}
+
+die() { echo "$PROG: error: $*" >&2; exit 1; }
+
+# ---------- parse arguments ----------
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o|--output)    [ $# -ge 2 ] || die "$1 requires a value"; OUT_DIR="$2"; shift 2 ;;
+    -r|--retention) [ $# -ge 2 ] || die "$1 requires a value"; RETENTION_DAYS="$2"; shift 2 ;;
+    --s3)           [ $# -ge 2 ] || die "$1 requires a value"; S3_DEST="$2"; shift 2 ;;
+    -h|--help)      usage; exit 0 ;;
+    -*)             die "unknown option: $1 (try --help)" ;;
+    *)              [ -z "$LOG_DIR" ] || die "only one log directory may be given"
+                    LOG_DIR="$1"; shift ;;
+  esac
+done
+
+# ---------- validate input ----------
+[ -n "$LOG_DIR" ] || { usage >&2; exit 1; }
+[ -d "$LOG_DIR" ] || die "not a directory: $LOG_DIR"
+[ -r "$LOG_DIR" ] || die "cannot read $LOG_DIR (try sudo, or give your terminal Full Disk Access)"
+
+if [ -n "$RETENTION_DAYS" ] && ! [[ "$RETENTION_DAYS" =~ ^[0-9]+$ ]]; then
+  die "--retention must be a whole number of days"
+fi
+
+if [ -n "$S3_DEST" ]; then
+  [[ "$S3_DEST" == s3://* ]] || die "--s3 must look like s3://bucket/prefix/"
+  command -v aws >/dev/null 2>&1 || die "aws CLI not found (macOS: brew install awscli)"
+fi
+
+# ---------- resolve paths ----------
+LOG_DIR="$(cd "$LOG_DIR" && pwd -P)"
+OUT_EXISTED=1; [ -d "$OUT_DIR" ] || OUT_EXISTED=0
+mkdir -p "$OUT_DIR"
+OUT_DIR="$(cd "$OUT_DIR" && pwd -P)"
+
+# Never write the archive into the directory we are archiving.
+case "$OUT_DIR/" in
+  "$LOG_DIR"/*)
+    [ "$OUT_EXISTED" -eq 1 ] || rmdir "$OUT_DIR" 2>/dev/null || true
+    die "output directory ($OUT_DIR) must not be inside $LOG_DIR" ;;
+esac
+
+TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+ARCHIVE_NAME="logs_archive_${TIMESTAMP}.tar.gz"
+ARCHIVE_PATH="$OUT_DIR/$ARCHIVE_NAME"
+LOG_FILE="$OUT_DIR/archive.log"
+
+log() {  # log LEVEL MESSAGE  -> appended to archive.log and echoed
+  printf '%s | %-6s | %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$2" | tee -a "$LOG_FILE"
+}
+
+# ---------- create the archive ----------
+# COPYFILE_DISABLE stops macOS tar from adding ._* AppleDouble metadata files.
+tar_rc=0
+COPYFILE_DISABLE=1 tar -czf "$ARCHIVE_PATH" -C "$LOG_DIR" . || tar_rc=$?
+
+if [ "$tar_rc" -ne 0 ]; then
+  log WARN "tar exited with code $tar_rc: some files may be unreadable or changed while being read"
+fi
+
+# ---------- verify the archive ----------
+if ! ENTRIES="$(tar -tzf "$ARCHIVE_PATH" | wc -l)"; then
+  rm -f "$ARCHIVE_PATH" || true
+  log ERROR "archive failed verification and was removed: $ARCHIVE_NAME"
+  exit 1
+fi
+ENTRIES="${ENTRIES//[[:space:]]/}"
+SIZE="$(du -h "$ARCHIVE_PATH" | cut -f1)"
+
+log OK "source=$LOG_DIR archive=$ARCHIVE_PATH size=$SIZE entries=$ENTRIES"
+
+# ---------- optional: upload to S3 ----------
+if [ -n "$S3_DEST" ]; then
+  S3_URI="${S3_DEST%/}/$ARCHIVE_NAME"
+  if aws s3 cp "$ARCHIVE_PATH" "$S3_URI" --only-show-errors; then
+    log UPLOAD "$S3_URI"
+  else
+    log ERROR "S3 upload failed: $S3_URI (local archive kept)"
+    exit 1
+  fi
+fi
+
+# ---------- optional: prune old archives ----------
+if [ -n "$RETENTION_DAYS" ]; then
+  find "$OUT_DIR" -maxdepth 1 -type f -name 'logs_archive_*.tar.gz' \
+       -mtime +"$RETENTION_DAYS" -print |
+  while IFS= read -r old; do
+    rm -f -- "$old"
+    log PRUNE "$old (older than $RETENTION_DAYS days)"
+  done
+fi
